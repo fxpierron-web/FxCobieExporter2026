@@ -1,0 +1,2389 @@
+// FXCobieExporter2026 — Enterprise-ready single-file ExportCobieCommand.cs
+// Revit 2026 + ClosedXML + Newtonsoft.Json
+//
+// EDGE PACK (1–4) INCLUDED:
+// ✅ (1) QC Review 3D: Maintainable assets turn RED until fixed (via view filter + QC_Fail param)
+// ✅ (2) Naming conventions: Non-BIM firms get compliant Asset IDs automatically (auto-generate + auto-fix non-compliant + write-back)
+// ✅ (3) Deployment-ready: predictable add-in folder layout + dependency strategy
+// ✅ (4) Hardened dependency loading: AssemblyResolve from add-in folder (client machines)
+//
+// STRICT COBie 2.4 OUTPUT: Facility, Floor, Space, Type, Component, System, Attribute + Compliance + Meta.
+//
+// 🔥 FIX INCLUDED (your complaint):
+// - STRICT Attribute sheet is now SERIOUSLY grouped:
+//   RowName = Component Name (AssetName) not random ids
+//   Deduped (no pollution)
+//   Sorted by AssetName then Attribute name
+//   ExternalIdentifier = Component UniqueId (best practice)
+//
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text.RegularExpressions;
+
+using Autodesk.Revit.Attributes;
+using Autodesk.Revit.DB;
+using Autodesk.Revit.DB.Architecture;
+using Autodesk.Revit.DB.Mechanical;
+using Autodesk.Revit.DB.Plumbing;
+using Autodesk.Revit.DB.Electrical;
+using Autodesk.Revit.UI;
+
+using ClosedXML.Excel;
+using Newtonsoft.Json;
+
+namespace CobieExporter2026
+{
+    [Transaction(TransactionMode.Manual)]
+    public class ExportCobieCommand : IExternalCommand
+    {
+        // ============================
+        // PRODUCT METADATA (ENTERPRISE)
+        // ============================
+        private const string PRODUCT_NAME = "FXCobieExporter2026";
+        private const string PRODUCT_VERSION = "1.1.0";
+        private const string PRODUCT_VENDOR = "FX";
+
+        // Dev toggles
+        private const bool EXPORT_ALL_PARAMS_DEBUG_SHEET = false;
+
+        // Behaviors
+        private const bool CURATED_ONLY = true;
+
+        // Auto naming behaviors (EDGE #2)
+        private const bool AUTO_GENERATE_MISSING_MARK = true;      // generate when Mark empty
+        private const bool AUTO_FIX_NON_COMPLIANT_MARK = true;     // if Mark exists but not compliant, replace with compliant AssetId (write-back)
+        private const bool ENFORCE_UPPERCASE_IDS = true;
+
+        // Default profile
+        private const ExportProfile DEFAULT_PROFILE = ExportProfile.FullAssetRegister;
+
+        // QC Review infra names (EDGE #1)
+        private const string QC_PARAM_NAME = "QC_Fail"; // Yes/No
+        private const string QC_VIEW_NAME = "QC Review - Maintainable Assets";
+        private const string QC_FILTER_NAME = "QC_Fail == Yes (Maintainable)";
+
+        // ============================
+        // EXPORT PROFILES
+        // ============================
+        private enum ExportProfile
+        {
+            ArchAssets,
+            MepAssets,
+            FullAssetRegister
+        }
+
+        // ============================
+        // COMPLIANCE ENGINE
+        // ============================
+        private enum Severity { CRITICAL = 3, WARNING = 2, INFO = 1 }
+
+        private sealed class ComplianceFinding
+        {
+            public Severity Severity;
+            public string RuleId;
+            public string RuleName;
+            public string TargetType;   // Project / Component / Type / Space etc.
+            public string TargetKey;    // ElementId, AssetName, TypeKey etc.
+            public string Message;
+            public string FixHint;
+            public double Weight;
+
+            public ComplianceFinding(
+                Severity sev,
+                string ruleId,
+                string ruleName,
+                string targetType,
+                string targetKey,
+                string message,
+                string fixHint,
+                double weight)
+            {
+                Severity = sev;
+                RuleId = ruleId;
+                RuleName = ruleName;
+                TargetType = targetType;
+                TargetKey = targetKey;
+                Message = message;
+                FixHint = fixHint;
+                Weight = weight;
+            }
+        }
+
+        private sealed class ComplianceResult
+        {
+            public int ScorePercent;
+            public bool Passed;
+            public int CriticalCount;
+            public int WarningCount;
+            public int InfoCount;
+            public string Summary;
+            public List<ComplianceFinding> Findings = new List<ComplianceFinding>();
+        }
+
+        // ============================
+        // OPTIONS + MAPPING + NAMING
+        // ============================
+        private sealed class ExportOptions
+        {
+            public ExportProfile Profile = DEFAULT_PROFILE;
+
+            // Strict COBie output
+            public bool StrictCobie24 = true;
+
+            // Mapping JSON (synonyms + defaults)
+            public bool UseMappingFile = true;
+            public string MappingFilePath = "";
+
+            // Compliance gate
+            public bool EnableComplianceGate = true;
+            public int MinScoreToPass = 80;
+
+            // Delivery metadata
+            public string CreatedBy = "";
+            public string StageType = "AsBuilt";
+
+            // Resilience
+            public bool SafeMode = true;
+
+            // Naming conventions (non-BIM friendly)
+            public string ProjectCode = "PRJ";
+
+            // Default AssetId pattern: PRJ-CAT-LVL-0001
+            public string AssetIdWriteBackParam = "Mark"; // write generated compliant AssetId into this param (usually Mark)
+        }
+
+        private sealed class MappingConfig
+        {
+            public Defaults defaults { get; set; } = new Defaults();
+            public List<FieldMap> fields { get; set; } = new List<FieldMap>();
+
+            public sealed class Defaults
+            {
+                public string stageType { get; set; } = "AsBuilt";
+                public string createdBy { get; set; } = "";
+            }
+
+            public sealed class FieldMap
+            {
+                public string canonical { get; set; } = "";
+                public bool preferType { get; set; } = true;
+                public List<string> names { get; set; } = new List<string>();
+            }
+        }
+
+        // ============================
+        // DATA ROWS
+        // ============================
+        private sealed class FacilityRow
+        {
+            public string Name;
+            public string CreatedBy;
+            public string CreatedOn;
+            public string ProjectName;
+
+            public FacilityRow(string name, string createdBy, string createdOn, string projectName)
+            { Name = name; CreatedBy = createdBy; CreatedOn = createdOn; ProjectName = projectName; }
+        }
+
+        private sealed class FloorRow
+        {
+            public string Name;
+            public string Elevation;
+            public FloorRow(string name, string elevation) { Name = name; Elevation = elevation; }
+        }
+
+        private sealed class SpaceRow
+        {
+            public string SpaceName;
+            public string RoomNumber;
+            public string LevelName;
+            public string Area;
+
+            public SpaceRow(string spaceName, string roomNumber, string levelName, string area)
+            { SpaceName = spaceName; RoomNumber = roomNumber; LevelName = levelName; Area = area; }
+        }
+
+        private sealed class TypeRow
+        {
+            public string TypeKey;
+            public string FamilyName;
+            public string TypeName;
+            public string Category;
+            public int TypeId;
+
+            public TypeRow(string typeKey, string familyName, string typeName, string category, int typeId)
+            { TypeKey = typeKey; FamilyName = familyName; TypeName = typeName; Category = category; TypeId = typeId; }
+        }
+
+        private sealed class ComponentRow
+        {
+            public int ElementId;
+            public string UniqueId;
+            public string Category;
+            public string FamilyName;
+            public string TypeName;
+            public string TypeKey;
+            public string LevelName;
+            public string SpaceName;
+            public string Mark;
+            public string AssetName;           // final exported AssetName (compliant ID)
+            public bool AssetNameWasGenerated; // whether we generated/overrode for compliance
+
+            public ComponentRow(
+                int elementId,
+                string uniqueId,
+                string category,
+                string familyName,
+                string typeName,
+                string typeKey,
+                string levelName,
+                string spaceName,
+                string mark,
+                string assetName,
+                bool assetNameWasGenerated)
+            {
+                ElementId = elementId;
+                UniqueId = uniqueId;
+                Category = category;
+                FamilyName = familyName;
+                TypeName = typeName;
+                TypeKey = typeKey;
+                LevelName = levelName;
+                SpaceName = spaceName;
+                Mark = mark;
+                AssetName = assetName;
+                AssetNameWasGenerated = assetNameWasGenerated;
+            }
+        }
+
+        private sealed class SystemRow
+        {
+            public string SystemName;
+            public string SystemType;
+            public string ComponentElementId;
+            public SystemRow(string systemName, string systemType, string componentElementId)
+            { SystemName = systemName; SystemType = systemType; ComponentElementId = componentElementId; }
+        }
+
+        private sealed class AttributeRow
+        {
+            public string Target;       // "Component"
+            public string TargetKey;    // elementId string
+            public string ParamName;    // canonical
+            public string StorageType;  // "String"
+            public string ValueString;
+
+            public AttributeRow(string target, string targetKey, string paramName, string storageType, string valueString)
+            { Target = target; TargetKey = targetKey; ParamName = paramName; StorageType = storageType; ValueString = valueString; }
+        }
+
+        private sealed class QcRow
+        {
+            public string Metric;
+            public string Value;
+            public QcRow(string metric, string value) { Metric = metric; Value = value; }
+        }
+
+        private sealed class ExportLogger : IDisposable
+        {
+            private readonly StreamWriter _w;
+            public string LogPath { get; }
+
+            public ExportLogger(Document doc)
+            {
+                var dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    PRODUCT_NAME, "Logs");
+                Directory.CreateDirectory(dir);
+
+                LogPath = Path.Combine(dir, $"{PRODUCT_NAME}_{Sanitize(doc?.Title)}_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+                _w = new StreamWriter(LogPath) { AutoFlush = true };
+
+                Write("Jrn.Start", $"Doc=\"{doc?.Title}\" User=\"{Environment.UserName}\" Machine=\"{Environment.MachineName}\"");
+            }
+
+            public void Write(string code, string msg = "")
+                => _w.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} | {code} | {msg}");
+
+            public void Dispose()
+            {
+                Write("Jrn.End", "OK");
+                _w.Dispose();
+            }
+        }
+
+        // ============================
+        // EDGE #4: HARDENED DEPENDENCY LOADING
+        // ============================
+        private static class FxBootstrapper
+        {
+            private static bool _installed;
+
+            public static void EnsureAssemblyResolve()
+            {
+                if (_installed) return;
+                _installed = true;
+
+                AppDomain.CurrentDomain.AssemblyResolve += (sender, args) =>
+                {
+                    try
+                    {
+                        // BaseDirectory resolves to Revit.exe folder, not add-in folder.
+                        // We want: folder of THIS assembly (addin folder).
+                        var thisAsm = Assembly.GetExecutingAssembly();
+                        var asmPath = thisAsm.Location;
+                        var baseDir = Path.GetDirectoryName(asmPath) ?? AppDomain.CurrentDomain.BaseDirectory;
+
+                        var asmName = new AssemblyName(args.Name).Name + ".dll";
+                        var candidate = Path.Combine(baseDir, asmName);
+
+                        if (File.Exists(candidate))
+                            return Assembly.LoadFrom(candidate);
+                    }
+                    catch { }
+
+                    return null;
+                };
+            }
+        }
+
+        // ============================
+        // EDGE #1: QC REVIEW 3D (Maintainable assets only)
+        // ============================
+        private static readonly List<BuiltInCategory> MaintainableCategories = new List<BuiltInCategory>
+        {
+            BuiltInCategory.OST_MechanicalEquipment,
+            BuiltInCategory.OST_PlumbingFixtures,
+            BuiltInCategory.OST_PlumbingEquipment,
+            BuiltInCategory.OST_ElectricalEquipment,
+            BuiltInCategory.OST_ElectricalFixtures,
+            BuiltInCategory.OST_LightingFixtures,
+            BuiltInCategory.OST_FireAlarmDevices,
+            BuiltInCategory.OST_DataDevices,
+            BuiltInCategory.OST_CommunicationDevices,
+            BuiltInCategory.OST_SecurityDevices,
+            BuiltInCategory.OST_SpecialityEquipment
+        };
+
+        private static void EnsureQcReviewInfrastructure(Document doc)
+        {
+            using (var t = new Transaction(doc, "FX QC Review Setup"))
+            {
+                t.Start();
+
+                var catSet = ToCategorySet(doc, MaintainableCategories);
+                var qcParamId = EnsureYesNoProjectParameter(doc, QC_PARAM_NAME, catSet);
+
+                var filterId = EnsureParameterFilter_QcFailYes(doc, qcParamId, catSet);
+
+                var view = Ensure3DView(doc, QC_VIEW_NAME);
+                ApplyRedFilter(view, filterId, doc);
+
+                t.Commit();
+            }
+        }
+
+        private static void ApplyQcFlags(Document doc, IEnumerable<ElementId> failingMaintainableIds)
+        {
+            var failing = new HashSet<ElementId>(failingMaintainableIds ?? Enumerable.Empty<ElementId>());
+
+            using (var t = new Transaction(doc, "FX QC Flag Update"))
+            {
+                t.Start();
+
+                foreach (var e in CollectMaintainables(doc))
+                    SetQcFail(e, false);
+
+                foreach (var id in failing)
+                {
+                    var e = doc.GetElement(id);
+                    if (e != null) SetQcFail(e, true);
+                }
+
+                t.Commit();
+            }
+        }
+
+        private static void OpenQcReviewView(UIDocument uiDoc)
+        {
+            var doc = uiDoc.Document;
+            var view = new FilteredElementCollector(doc)
+                .OfClass(typeof(View3D))
+                .Cast<View3D>()
+                .FirstOrDefault(v => !v.IsTemplate && v.Name.Equals(QC_VIEW_NAME, StringComparison.OrdinalIgnoreCase));
+
+            if (view != null)
+                uiDoc.ActiveView = view;
+        }
+
+        private static IEnumerable<Element> CollectMaintainables(Document doc)
+        {
+            var filters = MaintainableCategories
+                .Select(bic => (ElementFilter)new ElementCategoryFilter(bic))
+                .ToList();
+
+            ElementFilter catFilter = filters.Count == 1 ? filters[0] : new LogicalOrFilter(filters);
+
+            return new FilteredElementCollector(doc)
+                .WhereElementIsNotElementType()
+                .WherePasses(catFilter)
+                .Where(e => e != null && e.Category != null && !e.ViewSpecific);
+        }
+
+        private static void SetQcFail(Element e, bool fail)
+        {
+            var p = e.LookupParameter(QC_PARAM_NAME);
+            if (p == null || p.IsReadOnly) return;
+            p.Set(fail ? 1 : 0);
+        }
+
+        private static CategorySet ToCategorySet(Document doc, IEnumerable<BuiltInCategory> bics)
+        {
+            var set = doc.Application.Create.NewCategorySet();
+            foreach (var bic in bics)
+            {
+                var c = Category.GetCategory(doc, bic);
+                if (c != null) set.Insert(c);
+            }
+            return set;
+        }
+
+        private static ElementId EnsureYesNoProjectParameter(Document doc, string paramName, CategorySet cats)
+        {
+            var existing = new FilteredElementCollector(doc)
+                .OfClass(typeof(SharedParameterElement))
+                .Cast<SharedParameterElement>()
+                .FirstOrDefault(s => s.GetDefinition() != null && s.GetDefinition().Name == paramName);
+
+            if (existing != null)
+            {
+                EnsureBinding(doc, existing.GetDefinition(), cats);
+                return existing.Id;
+            }
+
+            var app = doc.Application;
+
+            var spDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                PRODUCT_NAME);
+            Directory.CreateDirectory(spDir);
+
+            var spFile = Path.Combine(spDir, "FXCobieExporter_SharedParams.txt");
+            if (!File.Exists(spFile)) File.WriteAllText(spFile, "# FX shared parameters\n");
+
+            var oldSp = app.SharedParametersFilename;
+            app.SharedParametersFilename = spFile;
+
+            try
+            {
+                var defFile = app.OpenSharedParameterFile();
+                if (defFile == null) throw new InvalidOperationException("Unable to open shared parameter file.");
+
+                var group = defFile.Groups.get_Item("FX") ?? defFile.Groups.Create("FX");
+
+                var opt = new ExternalDefinitionCreationOptions(paramName, SpecTypeId.Boolean.YesNo)
+                {
+                    Visible = true,
+                    UserModifiable = true
+                };
+
+                var def = group.Definitions.get_Item(paramName) as ExternalDefinition
+                          ?? group.Definitions.Create(opt) as ExternalDefinition;
+
+                if (def == null) throw new InvalidOperationException("Failed to create shared parameter definition.");
+
+                var spe = SharedParameterElement.Create(doc, def);
+                EnsureBinding(doc, spe.GetDefinition(), cats);
+
+                return spe.Id;
+            }
+            finally
+            {
+                app.SharedParametersFilename = oldSp;
+            }
+        }
+
+        private static void EnsureBinding(Document doc, Definition def, CategorySet cats)
+        {
+            if (doc == null || def == null || cats == null) return;
+
+            var map = doc.ParameterBindings;
+            var binding = doc.Application.Create.NewInstanceBinding(cats);
+            var existing = map.get_Item(def);
+
+            try
+            {
+                if (existing == null)
+                {
+                    var insert = map.GetType().GetMethods()
+                        .FirstOrDefault(m => m.Name == "Insert" && m.GetParameters().Length == 3);
+
+                    if (insert != null)
+                    {
+                        var p3 = insert.GetParameters()[2].ParameterType;
+                        object groupArg = null;
+
+                        var generalProp = typeof(GroupTypeId).GetProperty("General", BindingFlags.Public | BindingFlags.Static);
+                        if (generalProp != null && p3.IsAssignableFrom(generalProp.PropertyType))
+                            groupArg = generalProp.GetValue(null, null);
+
+                        if (groupArg == null && p3 == typeof(BuiltInParameterGroup))
+                            groupArg = BuiltInParameterGroup.PG_GENERAL;
+
+                        if (groupArg != null)
+                        {
+                            insert.Invoke(map, new object[] { def, binding, groupArg });
+                            return;
+                        }
+                    }
+
+                    map.Insert(def, binding, BuiltInParameterGroup.PG_GENERAL);
+                }
+                else
+                {
+                    map.ReInsert(def, binding);
+                }
+            }
+            catch { }
+        }
+
+        private static ElementId EnsureParameterFilter_QcFailYes(Document doc, ElementId qcParamId, CategorySet cats)
+        {
+            var catIds = new List<ElementId>();
+            foreach (Category c in cats) catIds.Add(c.Id);
+
+            var existing = new FilteredElementCollector(doc)
+                .OfClass(typeof(ParameterFilterElement))
+                .Cast<ParameterFilterElement>()
+                .FirstOrDefault(f => f.Name.Equals(QC_FILTER_NAME, StringComparison.OrdinalIgnoreCase));
+
+            if (existing != null)
+                return existing.Id;
+
+            FilterRule rule = null;
+            try
+            {
+                rule = ParameterFilterRuleFactory.CreateEqualsRule(qcParamId, 1);
+            }
+            catch
+            {
+                var provider = new ParameterValueProvider(qcParamId);
+                var evaluator = new FilterNumericEquals();
+                rule = new FilterIntegerRule(provider, evaluator, 1);
+            }
+
+            var epf = new ElementParameterFilter(rule);
+            var created = ParameterFilterElement.Create(doc, QC_FILTER_NAME, catIds, epf);
+            return created.Id;
+        }
+
+        private static View3D Ensure3DView(Document doc, string name)
+        {
+            var existing = new FilteredElementCollector(doc)
+                .OfClass(typeof(View3D))
+                .Cast<View3D>()
+                .FirstOrDefault(v => !v.IsTemplate && v.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+            if (existing != null) return existing;
+
+            var vft = new FilteredElementCollector(doc)
+                .OfClass(typeof(ViewFamilyType))
+                .Cast<ViewFamilyType>()
+                .FirstOrDefault(x => x.ViewFamily == ViewFamily.ThreeDimensional);
+
+            if (vft == null) throw new InvalidOperationException("No 3D ViewFamilyType found.");
+
+            var v3d = View3D.CreateIsometric(doc, vft.Id);
+            v3d.Name = name;
+            return v3d;
+        }
+
+        private static ElementId GetSolidFillPatternId(Document doc)
+        {
+            try
+            {
+                var fp = new FilteredElementCollector(doc)
+                    .OfClass(typeof(FillPatternElement))
+                    .Cast<FillPatternElement>()
+                    .FirstOrDefault(x => x.GetFillPattern() != null && x.GetFillPattern().IsSolidFill);
+
+                return fp != null ? fp.Id : ElementId.InvalidElementId;
+            }
+            catch { return ElementId.InvalidElementId; }
+        }
+
+        private static void ApplyRedFilter(View view, ElementId filterId, Document doc)
+        {
+            if (!view.GetFilters().Contains(filterId))
+                view.AddFilter(filterId);
+
+            view.SetFilterVisibility(filterId, true);
+
+            var red = new Autodesk.Revit.DB.Color(255, 0, 0);
+            var ogs = new OverrideGraphicSettings();
+
+            var solidId = GetSolidFillPatternId(doc);
+            if (solidId != ElementId.InvalidElementId)
+            {
+                ogs.SetSurfaceForegroundPatternId(solidId);
+                ogs.SetSurfaceForegroundPatternColor(red);
+
+                ogs.SetCutForegroundPatternId(solidId);
+                ogs.SetCutForegroundPatternColor(red);
+            }
+
+            ogs.SetProjectionLineColor(red);
+            ogs.SetCutLineColor(red);
+
+            view.SetFilterOverrides(filterId, ogs);
+        }
+
+        // ============================
+        // EXECUTE
+        // ============================
+        public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
+        {
+            FxBootstrapper.EnsureAssemblyResolve();
+
+            var uiDoc = commandData.Application.ActiveUIDocument;
+            var doc = uiDoc.Document;
+
+            ExportLogger log = null;
+
+            try
+            {
+                var options = ShowProfilePicker(doc);
+                ApplyMappingDefaults(doc, options);
+                options.ProjectCode = GetProjectCode(doc);
+
+                log = new ExportLogger(doc);
+                log.Write("Product.Name", PRODUCT_NAME);
+                log.Write("Product.Version", PRODUCT_VERSION);
+                log.Write("Product.Vendor", PRODUCT_VENDOR);
+
+                log.Write("Jrn.Command", "ExportCobieCommand");
+                log.Write("Opt.Profile", options.Profile.ToString());
+                log.Write("Opt.StrictCobie24", options.StrictCobie24.ToString());
+                log.Write("Opt.UseMappingFile", options.UseMappingFile.ToString());
+                log.Write("Opt.MappingPath", options.MappingFilePath ?? "");
+                log.Write("Opt.Gate", options.EnableComplianceGate.ToString());
+                log.Write("Opt.MinScore", options.MinScoreToPass.ToString());
+                log.Write("Opt.CreatedBy", options.CreatedBy ?? "");
+                log.Write("Opt.StageType", options.StageType ?? "");
+                log.Write("Opt.SafeMode", options.SafeMode.ToString());
+                log.Write("Opt.ProjectCode", options.ProjectCode ?? "");
+                log.Write("Opt.AssetIdWriteBackParam", options.AssetIdWriteBackParam ?? "");
+
+                if (options.UseMappingFile && !string.IsNullOrWhiteSpace(options.MappingFilePath))
+                {
+                    try
+                    {
+                        var map = LoadMappingOrDefault(options.MappingFilePath);
+                        if (!TryValidateMapping(map, out var warn))
+                            log.Write("Mapping.Warning", warn);
+                        else
+                            log.Write("Mapping.OK", "true");
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Write("Mapping.Error", ex.Message);
+                    }
+                }
+
+                EnsureQcReviewInfrastructure(doc);
+
+                string outPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                    $"COBie_Export_{Sanitize(doc.Title)}_{DateTime.Now:yyyyMMdd_HHmm}.xlsx"
+                );
+                log.Write("Export.Path", outPath);
+
+                var facility = BuildFacility(doc, options);
+                var floors = BuildFloors(doc);
+                var spaces = BuildSpaces(doc);
+
+                var components = CollectAssetComponents(doc, options.Profile);
+                var types = CollectUsedTypes(doc, components);
+
+                var componentRows = BuildComponentRows(doc, components, options);
+
+                EnforceUniqueAssetNames(componentRows);
+
+                TryWriteBackAssetIds(doc, components, componentRows, options, log);
+
+                var systemRows = BuildSystems(doc, components, componentRows, options.SafeMode);
+
+                var cobieAttributes = BuildCobieAttributes(
+                    doc,
+                    components,
+                    componentRows,
+                    options.Profile,
+                    curatedOnly: CURATED_ONLY,
+                    options: options
+                );
+
+                var allParams = EXPORT_ALL_PARAMS_DEBUG_SHEET
+                    ? BuildAllParamsDump(doc, components, types)
+                    : new List<AttributeRow>();
+
+                var qc = BuildQcReport(doc, facility, floors, spaces, types, componentRows, systemRows, cobieAttributes, options.Profile);
+
+                var compliance = BuildCompliance(facility, componentRows, cobieAttributes, options.Profile, options);
+
+                log.Write("Compliance.Score", compliance.ScorePercent.ToString());
+                log.Write("Compliance.Passed", compliance.Passed.ToString());
+                log.Write("Compliance.Critical", compliance.CriticalCount.ToString());
+                log.Write("Compliance.Warning", compliance.WarningCount.ToString());
+                log.Write("Compliance.Info", compliance.InfoCount.ToString());
+
+                var failingMaintainableIds = compliance.Findings
+                    .Where(f => f.TargetType == "Component" && int.TryParse(f.TargetKey, out _))
+                    .Select(f => new ElementId(int.Parse(f.TargetKey)))
+                    .Where(id => IsMaintainable(doc, id))
+                    .ToList();
+
+                ApplyQcFlags(doc, failingMaintainableIds);
+
+                if (options.EnableComplianceGate && !compliance.Passed)
+                {
+                    var td = new TaskDialog("COBie Export Blocked");
+                    td.MainInstruction = "Compliance gate failed";
+                    td.MainContent =
+                        $"{compliance.Summary}\n\n" +
+                        $"Maintainable assets that failed are now RED in:\n{QC_VIEW_NAME}\n\n" +
+                        "Fix CRITICAL items and run again.\n\n" +
+                        "You can still export a DRAFT if you accept the risk.";
+
+                    td.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, $"Open {QC_VIEW_NAME}");
+                    td.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Export DRAFT anyway (not recommended)");
+                    td.AddCommandLink(TaskDialogCommandLinkId.CommandLink3, "Cancel");
+
+                    var choice = td.Show();
+
+                    if (choice == TaskDialogResult.CommandLink1)
+                    {
+                        OpenQcReviewView(uiDoc);
+                        return Result.Cancelled;
+                    }
+                    if (choice == TaskDialogResult.CommandLink3)
+                    {
+                        return Result.Cancelled;
+                    }
+
+                    log.Write("Gate.Override", "ExportedDraftAnyway=true");
+                }
+
+                log.Write("Mode", options.StrictCobie24 ? "StrictCOBie24" : "Standard");
+
+                if (options.StrictCobie24)
+                {
+                    WriteWorkbookStrictCobie24(
+                        outPath,
+                        doc,
+                        options,
+                        log.LogPath,
+                        facility,
+                        floors,
+                        spaces,
+                        types,
+                        componentRows,
+                        systemRows,
+                        cobieAttributes,
+                        compliance
+                    );
+                }
+                else
+                {
+                    WriteWorkbook(
+                        outPath,
+                        doc,
+                        options,
+                        log.LogPath,
+                        facility,
+                        floors,
+                        spaces,
+                        types,
+                        componentRows,
+                        systemRows,
+                        cobieAttributes,
+                        allParams,
+                        qc,
+                        compliance,
+                        options.Profile
+                    );
+                }
+
+                log.Write("Jrn.Success", "Export complete");
+
+                TaskDialog.Show(
+                    "COBie Export",
+                    $"{PRODUCT_NAME} v{PRODUCT_VERSION}\n\nExport complete:\n{outPath}\n\nLog:\n{log.LogPath}"
+                );
+
+                return Result.Succeeded;
+            }
+            catch (Exception ex)
+            {
+                try { log?.Write("Jrn.Error", ex.ToString()); } catch { }
+                message = ex.ToString();
+                return Result.Failed;
+            }
+            finally
+            {
+                try { log?.Dispose(); } catch { }
+            }
+        }
+
+        private static bool IsMaintainable(Document doc, ElementId id)
+        {
+            try
+            {
+                var e = doc.GetElement(id);
+                if (e?.Category == null) return false;
+                var bic = (BuiltInCategory)(int)e.Category.Id.Value;
+                return MaintainableCategories.Contains(bic);
+            }
+            catch { return false; }
+        }
+
+        // ============================
+        // OPTIONS UI
+        // ============================
+        private ExportOptions ShowProfilePicker(Document doc)
+        {
+            var opt = new ExportOptions
+            {
+                Profile = DEFAULT_PROFILE,
+                StrictCobie24 = true,
+                UseMappingFile = true,
+                MappingFilePath = GetDefaultMappingPath(doc),
+                EnableComplianceGate = true,
+                MinScoreToPass = 80,
+                CreatedBy = Environment.UserName,
+                StageType = "AsBuilt",
+                SafeMode = true,
+
+                ProjectCode = GetProjectCode(doc),
+                AssetIdWriteBackParam = "Mark"
+            };
+
+            var td = new TaskDialog("COBie Export Options");
+            td.MainInstruction = "Choose an export profile";
+            td.MainContent =
+                "ARCH = Doors/Windows\n" +
+                "MEP  = Maintainable MEP assets\n" +
+                "FULL = Combined asset register\n\n" +
+                "Strict COBie 2.4 mode writes standard COBie sheets.";
+
+            td.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "ARCH Assets");
+            td.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "MEP Assets");
+            td.AddCommandLink(TaskDialogCommandLinkId.CommandLink3, "FULL Asset Register");
+
+            td.VerificationText = "Strict COBie 2.4 mode (recommended for client delivery)";
+
+            var result = td.Show();
+            opt.StrictCobie24 = td.WasVerificationChecked();
+
+            if (result == TaskDialogResult.CommandLink1) opt.Profile = ExportProfile.ArchAssets;
+            else if (result == TaskDialogResult.CommandLink2) opt.Profile = ExportProfile.MepAssets;
+            else opt.Profile = ExportProfile.FullAssetRegister;
+
+            opt.UseMappingFile = true;
+
+            return opt;
+        }
+
+        private static string GetDefaultMappingPath(Document doc)
+        {
+            try
+            {
+                if (doc != null && !string.IsNullOrWhiteSpace(doc.PathName) && File.Exists(doc.PathName))
+                {
+                    var modelDir = Path.GetDirectoryName(doc.PathName);
+                    if (!string.IsNullOrWhiteSpace(modelDir))
+                        return Path.Combine(modelDir, "CobieMapping.json");
+                }
+            }
+            catch { }
+
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                PRODUCT_NAME);
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "CobieMapping.json");
+        }
+
+        private void ApplyMappingDefaults(Document doc, ExportOptions opt)
+        {
+            if (opt == null) return;
+
+            if (string.IsNullOrWhiteSpace(opt.CreatedBy)) opt.CreatedBy = Environment.UserName;
+            if (string.IsNullOrWhiteSpace(opt.StageType)) opt.StageType = "AsBuilt";
+            if (string.IsNullOrWhiteSpace(opt.MappingFilePath)) opt.MappingFilePath = GetDefaultMappingPath(doc);
+
+            if (!opt.UseMappingFile) return;
+            if (string.IsNullOrWhiteSpace(opt.MappingFilePath)) return;
+
+            var map = LoadMappingOrDefault(opt.MappingFilePath);
+            if (map?.defaults == null) return;
+
+            if (!string.IsNullOrWhiteSpace(map.defaults.createdBy))
+                opt.CreatedBy = map.defaults.createdBy;
+
+            if (!string.IsNullOrWhiteSpace(map.defaults.stageType))
+                opt.StageType = map.defaults.stageType;
+        }
+
+        private static bool TryValidateMapping(MappingConfig map, out string warning)
+        {
+            warning = "";
+            if (map == null) { warning = "Mapping file parsed null."; return false; }
+            if (map.fields == null) { warning = "Mapping file 'fields' missing."; return false; }
+
+            var bad = map.fields
+                .Where(f => string.IsNullOrWhiteSpace(f.canonical) || f.names == null || f.names.Count == 0)
+                .ToList();
+
+            if (bad.Count > 0)
+            {
+                warning = $"Mapping has {bad.Count} invalid field entries (missing canonical or names).";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static MappingConfig LoadMappingOrDefault(string path)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                    return new MappingConfig();
+
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    Directory.CreateDirectory(dir);
+
+                if (!File.Exists(path))
+                {
+                    File.WriteAllText(path,
+@"{
+  ""defaults"": { ""stageType"": ""AsBuilt"", ""createdBy"": """" },
+  ""fields"": [
+    { ""canonical"": ""Manufacturer"", ""preferType"": true, ""names"": [""Manufacturer"", ""Mfr"", ""Make"", ""Brand""] },
+    { ""canonical"": ""ModelNumber"",  ""preferType"": true, ""names"": [""Model"", ""Model Number"", ""ModelNumber""] },
+    { ""canonical"": ""SerialNumber"", ""preferType"": false, ""names"": [""Serial Number"", ""SerialNumber"", ""S/N"", ""SN""] }
+  ]
+}");
+                }
+
+                return JsonConvert.DeserializeObject<MappingConfig>(File.ReadAllText(path)) ?? new MappingConfig();
+            }
+            catch
+            {
+                return new MappingConfig();
+            }
+        }
+
+        // ============================
+        // NAMING (EDGE #2)
+        // ============================
+
+        private static bool IsCompliantAssetId(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            s = s.Trim();
+            return Regex.IsMatch(s, @"^[A-Za-z0-9_-]+-[A-Za-z0-9_-]+-[A-Za-z0-9_-]+-\d{4}$");
+        }
+
+        private static string NormalizeAssetId(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            s = s.Trim();
+            s = SanitizeId(s);
+            if (ENFORCE_UPPERCASE_IDS) s = s.ToUpperInvariant();
+            return s;
+        }
+
+        private static string GetProjectCode(Document doc)
+        {
+            try
+            {
+                var pi = doc?.ProjectInformation;
+                var code = pi?.Number;
+                if (!string.IsNullOrWhiteSpace(code)) return SanitizeId(code);
+
+                var title = doc?.Title ?? "PRJ";
+                var token = (title.Split(new[] { ' ', '-', '_' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "PRJ");
+                return SanitizeId(token);
+            }
+            catch { return "PRJ"; }
+        }
+
+        private static string BuildAssetId(string projectCode, string categoryName, string levelName, int seq)
+        {
+            var prj = SanitizeId(projectCode);
+            var cat = Abbrev(categoryName);
+            var lvl = SanitizeId(levelName);
+            var id = $"{prj}-{cat}-{lvl}-{seq:0000}";
+            if (ENFORCE_UPPERCASE_IDS) id = id.ToUpperInvariant();
+            return id;
+        }
+
+        private static void EnforceUniqueAssetNames(List<ComponentRow> rows)
+        {
+            if (rows == null || rows.Count == 0) return;
+
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var r in rows.OrderBy(x => x.LevelName).ThenBy(x => x.Category).ThenBy(x => x.ElementId))
+            {
+                var baseId = NormalizeAssetId(r.AssetName);
+                if (string.IsNullOrWhiteSpace(baseId))
+                    baseId = $"ASSET-{r.ElementId:0000}";
+
+                var candidate = baseId;
+                int k = 1;
+
+                while (used.Contains(candidate))
+                {
+                    candidate = $"{baseId}_{k}";
+                    if (ENFORCE_UPPERCASE_IDS) candidate = candidate.ToUpperInvariant();
+                    k++;
+                }
+
+                used.Add(candidate);
+                r.AssetName = candidate;
+            }
+        }
+
+        private static void TryWriteBackAssetIds(Document doc, List<Element> components, List<ComponentRow> rows, ExportOptions opt, ExportLogger log)
+        {
+            if (opt == null) return;
+            if (string.IsNullOrWhiteSpace(opt.AssetIdWriteBackParam)) return;
+
+            using (var t = new Transaction(doc, "FX Write-back Asset IDs"))
+            {
+                try
+                {
+                    t.Start();
+
+                    var rowById = rows.ToDictionary(r => r.ElementId, r => r);
+
+                    foreach (var e in components)
+                    {
+                        int eid = (int)e.Id.Value;
+                        if (!rowById.TryGetValue(eid, out var r)) continue;
+
+                        var currentMark = GetBuiltInParamAsString(e, BuiltInParameter.ALL_MODEL_MARK);
+                        var hasMark = !string.IsNullOrWhiteSpace(currentMark);
+
+                        bool shouldWrite =
+                            (!hasMark && r.AssetNameWasGenerated)
+                            || (hasMark && AUTO_FIX_NON_COMPLIANT_MARK && !IsCompliantAssetId(NormalizeAssetId(currentMark)));
+
+                        if (!shouldWrite) continue;
+                        if (string.IsNullOrWhiteSpace(r.AssetName)) continue;
+
+                        var p = e.LookupParameter(opt.AssetIdWriteBackParam);
+                        if (p == null || p.IsReadOnly) continue;
+
+                        if (p.StorageType == StorageType.String)
+                            p.Set(r.AssetName);
+                    }
+
+                    t.Commit();
+                    log?.Write("Naming.WriteBack", "OK");
+                }
+                catch (Exception ex)
+                {
+                    log?.Write("Naming.WriteBack.Error", ex.Message);
+                    try { if (t.HasStarted()) t.RollBack(); } catch { }
+                }
+            }
+        }
+
+        // ============================
+        // FACILITY / FLOOR / SPACE
+        // ============================
+        private static FacilityRow BuildFacility(Document doc, ExportOptions opt)
+        {
+            string createdBy = string.IsNullOrWhiteSpace(opt?.CreatedBy) ? Environment.UserName : opt.CreatedBy;
+            string createdOn = DateTime.Now.ToString("yyyy-MM-dd");
+            string name = string.IsNullOrWhiteSpace(doc.ProjectInformation?.Name) ? doc.Title : doc.ProjectInformation.Name;
+            return new FacilityRow(name ?? "", createdBy, createdOn, doc.Title ?? "");
+        }
+
+        private static List<FloorRow> BuildFloors(Document doc)
+        {
+            return new FilteredElementCollector(doc)
+                .OfClass(typeof(Level))
+                .Cast<Level>()
+                .OrderBy(l => l.Elevation)
+                .Select(l => new FloorRow(l.Name ?? "", l.Elevation.ToString("0.###")))
+                .ToList();
+        }
+
+        private static List<SpaceRow> BuildSpaces(Document doc)
+        {
+            var rooms = new FilteredElementCollector(doc)
+                .OfCategory(BuiltInCategory.OST_Rooms)
+                .WhereElementIsNotElementType()
+                .Cast<Room>()
+                .Where(r => r != null && r.Area > 0)
+                .ToList();
+
+            return rooms.Select(r => new SpaceRow(
+                spaceName: r.Name ?? "",
+                roomNumber: r.Number ?? "",
+                levelName: r.Level?.Name ?? "",
+                area: r.Area.ToString("0.##")
+            )).ToList();
+        }
+
+        // ============================
+        // ASSET COLLECTION
+        // ============================
+        private static readonly HashSet<BuiltInCategory> NeverAssetDenyList = new HashSet<BuiltInCategory>
+        {
+            BuiltInCategory.OST_Views,
+            BuiltInCategory.OST_Sheets,
+            BuiltInCategory.OST_Cameras,
+            BuiltInCategory.OST_TextNotes,
+            BuiltInCategory.OST_Lines,
+            BuiltInCategory.OST_DetailComponents,
+            BuiltInCategory.OST_GenericAnnotation,
+            BuiltInCategory.OST_Dimensions,
+            BuiltInCategory.OST_Tags,
+
+            BuiltInCategory.OST_Levels,
+            BuiltInCategory.OST_Grids,
+
+            BuiltInCategory.OST_Rooms,
+            BuiltInCategory.OST_MEPSpaces,
+        };
+
+        private static readonly HashSet<BuiltInCategory> ArchAssetAllowList = new HashSet<BuiltInCategory>
+        {
+            BuiltInCategory.OST_Doors,
+            BuiltInCategory.OST_Windows,
+        };
+
+        private static readonly HashSet<BuiltInCategory> MepAssetAllowList = new HashSet<BuiltInCategory>
+        {
+            BuiltInCategory.OST_MechanicalEquipment,
+            BuiltInCategory.OST_PlumbingFixtures,
+            BuiltInCategory.OST_PlumbingEquipment,
+            BuiltInCategory.OST_ElectricalEquipment,
+            BuiltInCategory.OST_ElectricalFixtures,
+            BuiltInCategory.OST_LightingFixtures,
+            BuiltInCategory.OST_FireAlarmDevices,
+            BuiltInCategory.OST_SecurityDevices,
+            BuiltInCategory.OST_SpecialityEquipment,
+            BuiltInCategory.OST_DataDevices,
+            BuiltInCategory.OST_CommunicationDevices,
+        };
+
+        private static List<Element> CollectAssetComponents(Document doc, ExportProfile profile)
+        {
+            var allow = new HashSet<BuiltInCategory>();
+            if (profile == ExportProfile.ArchAssets || profile == ExportProfile.FullAssetRegister) allow.UnionWith(ArchAssetAllowList);
+            if (profile == ExportProfile.MepAssets || profile == ExportProfile.FullAssetRegister) allow.UnionWith(MepAssetAllowList);
+
+            if (allow.Count == 0) return new List<Element>();
+
+            var filters = allow.Select(bic => (ElementFilter)new ElementCategoryFilter(bic)).ToList();
+            ElementFilter catFilter = filters.Count == 1 ? filters[0] : new LogicalOrFilter(filters);
+
+            return new FilteredElementCollector(doc)
+                .WhereElementIsNotElementType()
+                .WherePasses(catFilter)
+                .ToElements()
+                .Where(e => e != null && e.Category != null && !e.ViewSpecific)
+                .Where(e =>
+                {
+                    var bic = (BuiltInCategory)(int)e.Category.Id.Value;
+                    if (NeverAssetDenyList.Contains(bic)) return false;
+                    return allow.Contains(bic);
+                })
+                .ToList();
+        }
+
+        // ============================
+        // TYPES USED BY ASSETS ONLY
+        // ============================
+        private static List<TypeRow> CollectUsedTypes(Document doc, List<Element> components)
+        {
+            var usedTypeIds = new HashSet<ElementId>();
+            foreach (var e in components)
+            {
+                var tid = e.GetTypeId();
+                if (tid != ElementId.InvalidElementId)
+                    usedTypeIds.Add(tid);
+            }
+
+            var rows = new List<TypeRow>();
+            foreach (var tid in usedTypeIds)
+            {
+                if (!(doc.GetElement(tid) is ElementType t)) continue;
+
+                string familyName = (t as FamilySymbol)?.FamilyName ?? t.FamilyName ?? "";
+                string typeName = t.Name ?? "";
+                string category = t.Category?.Name ?? "";
+
+                string typeKey = $"{category}|{familyName}|{typeName}";
+                rows.Add(new TypeRow(typeKey, familyName, typeName, category, (int)tid.Value));
+            }
+
+            return rows
+                .OrderBy(t => t.Category)
+                .ThenBy(t => t.FamilyName)
+                .ThenBy(t => t.TypeName)
+                .ToList();
+        }
+
+        // ============================
+        // COMPONENT ROWS (Naming Intelligence)
+        // ============================
+        private static List<ComponentRow> BuildComponentRows(Document doc, List<Element> components, ExportOptions opt)
+        {
+            var rows = new List<ComponentRow>();
+            var counters = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var e in components)
+            {
+                string category = e.Category?.Name ?? "";
+
+                var typeId = e.GetTypeId();
+                var type = typeId != ElementId.InvalidElementId ? doc.GetElement(typeId) as ElementType : null;
+
+                string familyName = (type as FamilySymbol)?.FamilyName ?? type?.FamilyName ?? "";
+                string typeName = type?.Name ?? "";
+                string typeKey = $"{category}|{familyName}|{typeName}";
+
+                string levelName = TryGetLevelName(doc, e);
+                string spaceName = TryGetSpaceContext(e);
+
+                string mark = GetBuiltInParamAsString(e, BuiltInParameter.ALL_MODEL_MARK);
+                string markNorm = NormalizeAssetId(mark);
+
+                bool generated = false;
+                string assetName = "";
+
+                if (!string.IsNullOrWhiteSpace(markNorm))
+                {
+                    if (AUTO_FIX_NON_COMPLIANT_MARK && !IsCompliantAssetId(markNorm))
+                    {
+                        generated = true;
+
+                        string key = $"{levelName}|{category}";
+                        if (!counters.ContainsKey(key)) counters[key] = 0;
+                        counters[key] += 1;
+
+                        assetName = BuildAssetId(opt?.ProjectCode ?? "PRJ", category, levelName, counters[key]);
+                    }
+                    else
+                    {
+                        assetName = markNorm;
+                    }
+                }
+                else if (AUTO_GENERATE_MISSING_MARK)
+                {
+                    generated = true;
+
+                    string key = $"{levelName}|{category}";
+                    if (!counters.ContainsKey(key)) counters[key] = 0;
+                    counters[key] += 1;
+
+                    assetName = BuildAssetId(opt?.ProjectCode ?? "PRJ", category, levelName, counters[key]);
+                }
+                else
+                {
+                    assetName = NormalizeAssetId(e.Id.Value.ToString());
+                }
+
+                rows.Add(new ComponentRow(
+                    elementId: (int)e.Id.Value,
+                    uniqueId: e.UniqueId,
+                    category: category,
+                    familyName: familyName,
+                    typeName: typeName,
+                    typeKey: typeKey,
+                    levelName: levelName,
+                    spaceName: spaceName,
+                    mark: mark,
+                    assetName: assetName,
+                    assetNameWasGenerated: generated
+                ));
+            }
+
+            return rows;
+        }
+
+        private static string TryGetSpaceContext(Element e)
+        {
+            if (e is FamilyInstance fi && fi.Category != null)
+            {
+                int cat = (int)fi.Category.Id.Value;
+                if (cat == (int)BuiltInCategory.OST_Doors)
+                {
+                    Room from = fi.FromRoom;
+                    Room to = fi.ToRoom;
+                    string a = from != null ? $"{from.Number} {from.Name}".Trim() : "";
+                    string b = to != null ? $"{to.Number} {to.Name}".Trim() : "";
+                    if (!string.IsNullOrWhiteSpace(a) && !string.IsNullOrWhiteSpace(b)) return $"{a} <-> {b}";
+                    return !string.IsNullOrWhiteSpace(a) ? a : b;
+                }
+
+                Room r = fi.Room;
+                if (r != null) return $"{r.Number} {r.Name}".Trim();
+            }
+
+            return "";
+        }
+
+        // ============================
+        // SYSTEMS
+        // ============================
+        private static IList<MEPSystem> GetElementSystems(Element e)
+        {
+            var map = new Dictionary<ElementId, MEPSystem>();
+
+            if (e is MEPCurve curve)
+            {
+                var sys = curve.MEPSystem;
+                if (sys != null && sys.Id != ElementId.InvalidElementId)
+                    map[sys.Id] = sys;
+            }
+
+            if (e is FamilyInstance fi && fi.MEPModel != null)
+            {
+                ConnectorSet connectors = null;
+                try { connectors = fi.MEPModel.ConnectorManager?.Connectors; } catch { }
+
+                if (connectors != null)
+                {
+                    foreach (Connector c in connectors)
+                    {
+                        var sys = c?.MEPSystem;
+                        if (sys != null && sys.Id != ElementId.InvalidElementId)
+                            map[sys.Id] = sys;
+                    }
+                }
+            }
+
+            return map.Values.ToList();
+        }
+
+        private static List<SystemRow> BuildSystems(Document doc, List<Element> components, List<ComponentRow> componentRows, bool safeMode)
+        {
+            var rows = new List<SystemRow>();
+            var componentIdSet = new HashSet<int>(componentRows.Select(c => c.ElementId));
+
+            foreach (var e in components)
+            {
+                int eid = (int)e.Id.Value;
+                if (!componentIdSet.Contains(eid)) continue;
+
+                bool addedMep = false;
+
+                if (e is FamilyInstance fi && fi.MEPModel != null)
+                {
+                    try
+                    {
+                        var systems = GetElementSystems(e);
+                        foreach (var s in systems)
+                        {
+                            if (s == null) continue;
+                            if (string.IsNullOrWhiteSpace(s.Name)) continue;
+
+                            rows.Add(new SystemRow(
+                                systemName: s.Name,
+                                systemType: s.GetType().Name,
+                                componentElementId: eid.ToString()
+                            ));
+                            addedMep = true;
+                        }
+                    }
+                    catch
+                    {
+                        if (!safeMode) throw;
+                    }
+                }
+
+                if (!addedMep)
+                {
+                    var level = TryGetLevelName(doc, e);
+                    if (string.IsNullOrWhiteSpace(level)) level = "Unassigned";
+                    string catName = e.Category?.Name ?? "Uncategorised";
+
+                    rows.Add(new SystemRow(
+                        systemName: $"{Abbrev(catName)}_{SanitizeId(level)}",
+                        systemType: "Grouping",
+                        componentElementId: eid.ToString()
+                    ));
+                }
+            }
+
+            return rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.SystemName))
+                .GroupBy(r => (r.SystemName, r.SystemType, r.ComponentElementId))
+                .Select(g => g.First())
+                .OrderBy(r => r.SystemName)
+                .ToList();
+        }
+
+        // ============================
+        // COBie CURATED ATTRS + MAPPING
+        // ============================
+        private sealed class CobieField
+        {
+            public string CanonicalName;
+            public bool PreferType;
+            public List<string> ParamNames;
+            public BuiltInParameter? BuiltIn;
+
+            public CobieField(string canonicalName, bool preferType, IEnumerable<string> paramNames, BuiltInParameter? builtIn = null)
+            {
+                CanonicalName = canonicalName;
+                PreferType = preferType;
+                ParamNames = paramNames?.ToList() ?? new List<string>();
+                BuiltIn = builtIn;
+            }
+        }
+
+        private static List<CobieField> GetCobieFieldSetForProfile(ExportProfile profile)
+        {
+            var common = new List<CobieField>
+            {
+                new CobieField("Manufacturer",     true,  new[]{"Manufacturer","Mfr","Make","Brand"}),
+                new CobieField("ModelNumber",      true,  new[]{"Model","Model Number","ModelNumber","Type Mark","TypeMark"}),
+                new CobieField("SerialNumber",     false, new[]{"Serial Number","SerialNumber","S/N","SN"}),
+                new CobieField("InstallationDate", false, new[]{"Installation Date","Install Date","Installed On","Date Installed"}),
+                new CobieField("WarrantyDuration", true,  new[]{"Warranty Duration","WarrantyDuration","Warranty (Years)","Warranty Years"}),
+                new CobieField("WarrantyDescription",true,new[]{"Warranty Description","WarrantyDescription","Warranty"}),
+                new CobieField("ExpectedLife",     true,  new[]{"Expected Life","ExpectedLife","Service Life","Design Life","Life (Years)"}),
+                new CobieField("Comments",         false, new[]{"Comments"}, builtIn: BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS),
+                new CobieField("Mark",             false, new[]{"Mark"}, builtIn: BuiltInParameter.ALL_MODEL_MARK),
+            };
+
+            var arch = new List<CobieField>
+            {
+                new CobieField("FireRating",     true, new[]{"Fire Rating","FireRating"}, builtIn: BuiltInParameter.FIRE_RATING),
+                new CobieField("AcousticRating", true, new[]{"Acoustic Rating","AcousticRating","Sound Rating","Rw"}),
+            };
+
+            var mep = new List<CobieField>
+            {
+                new CobieField("Power",   true, new[]{"Power","Power (W)","Electrical Power"}),
+                new CobieField("Voltage", true, new[]{"Voltage","Voltage (V)"}),
+                new CobieField("Flow",    true, new[]{"Flow","Flow Rate","FlowRate"}),
+                new CobieField("Capacity",true, new[]{"Capacity","Cooling Capacity","Heating Capacity"}),
+            };
+
+            if (profile == ExportProfile.ArchAssets) return common.Concat(arch).ToList();
+            if (profile == ExportProfile.MepAssets) return common.Concat(mep).ToList();
+            return common.Concat(arch).Concat(mep).ToList();
+        }
+
+        private static List<AttributeRow> BuildCobieAttributes(
+            Document doc,
+            List<Element> components,
+            List<ComponentRow> componentRows,
+            ExportProfile profile,
+            bool curatedOnly,
+            ExportOptions options)
+        {
+            var rows = new List<AttributeRow>();
+            var fieldSet = GetCobieFieldSetForProfile(profile);
+
+            if (curatedOnly && options != null && options.UseMappingFile && !string.IsNullOrWhiteSpace(options.MappingFilePath))
+            {
+                var map = LoadMappingOrDefault(options.MappingFilePath);
+                if (map?.fields != null)
+                {
+                    foreach (var f in map.fields)
+                    {
+                        if (string.IsNullOrWhiteSpace(f.canonical)) continue;
+                        fieldSet.RemoveAll(x => x.CanonicalName.Equals(f.canonical, StringComparison.OrdinalIgnoreCase));
+                        fieldSet.Add(new CobieField(f.canonical, f.preferType, f.names));
+                    }
+                }
+            }
+
+            var compMap = componentRows.ToDictionary(c => c.ElementId, c => c);
+
+            foreach (var e in components)
+            {
+                int eid = (int)e.Id.Value;
+                if (!compMap.TryGetValue(eid, out var cr)) continue;
+
+                rows.Add(new AttributeRow("Component", eid.ToString(), "AssetName", "String", cr.AssetName ?? ""));
+                if (!string.IsNullOrWhiteSpace(cr.LevelName))
+                    rows.Add(new AttributeRow("Component", eid.ToString(), "LevelName", "String", cr.LevelName));
+                if (!string.IsNullOrWhiteSpace(cr.SpaceName))
+                    rows.Add(new AttributeRow("Component", eid.ToString(), "SpaceName", "String", cr.SpaceName));
+
+                ElementType t = null;
+                var tid = e.GetTypeId();
+                if (tid != ElementId.InvalidElementId)
+                    t = doc.GetElement(tid) as ElementType;
+
+                foreach (var field in fieldSet)
+                {
+                    string val = "";
+
+                    if (field.BuiltIn.HasValue)
+                    {
+                        val = TryGetBuiltInParamValue(e, field.BuiltIn.Value);
+                        if (string.IsNullOrWhiteSpace(val) && t != null)
+                            val = TryGetBuiltInParamValue(t, field.BuiltIn.Value);
+                    }
+
+                    if (string.IsNullOrWhiteSpace(val))
+                    {
+                        if (field.PreferType && t != null)
+                        {
+                            val = TryGetParamByNames(t, field.ParamNames);
+                            if (string.IsNullOrWhiteSpace(val))
+                                val = TryGetParamByNames(e, field.ParamNames);
+                        }
+                        else
+                        {
+                            val = TryGetParamByNames(e, field.ParamNames);
+                            if (string.IsNullOrWhiteSpace(val) && t != null)
+                                val = TryGetParamByNames(t, field.ParamNames);
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(val))
+                    {
+                        rows.Add(new AttributeRow(
+                            target: "Component",
+                            targetKey: eid.ToString(),
+                            paramName: field.CanonicalName,
+                            storageType: "String",
+                            valueString: val
+                        ));
+                    }
+                }
+            }
+
+            // keep it clean (dedupe)
+            return rows
+                .Where(r => !string.IsNullOrWhiteSpace(r.ParamName))
+                .Where(r => !string.IsNullOrWhiteSpace(r.ValueString))
+                .GroupBy(r => (r.Target, r.TargetKey, r.ParamName, r.ValueString), StringTupleComparer.Instance)
+                .Select(g => g.First())
+                .ToList();
+        }
+
+        // Custom comparer to dedupe tuples reliably across .NET versions (no weirdness)
+        private sealed class StringTupleComparer : IEqualityComparer<(string, string, string, string)>
+        {
+            public static readonly StringTupleComparer Instance = new StringTupleComparer();
+            public bool Equals((string, string, string, string) x, (string, string, string, string) y)
+            {
+                return string.Equals(x.Item1, y.Item1, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(x.Item2, y.Item2, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(x.Item3, y.Item3, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(x.Item4, y.Item4, StringComparison.OrdinalIgnoreCase);
+            }
+            public int GetHashCode((string, string, string, string) obj)
+            {
+                unchecked
+                {
+                    int h = 17;
+                    h = (h * 31) + (obj.Item1 ?? "").ToLowerInvariant().GetHashCode();
+                    h = (h * 31) + (obj.Item2 ?? "").ToLowerInvariant().GetHashCode();
+                    h = (h * 31) + (obj.Item3 ?? "").ToLowerInvariant().GetHashCode();
+                    h = (h * 31) + (obj.Item4 ?? "").ToLowerInvariant().GetHashCode();
+                    return h;
+                }
+            }
+        }
+
+        // ============================
+        // COMPLIANCE
+        // ============================
+        private static ComplianceResult BuildCompliance(
+            FacilityRow facility,
+            List<ComponentRow> components,
+            List<AttributeRow> attributesCobie,
+            ExportProfile profile,
+            ExportOptions options)
+        {
+            var res = new ComplianceResult();
+
+            var attrByComp = attributesCobie
+                .Where(a => a.Target == "Component")
+                .GroupBy(a => a.TargetKey)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            bool HasAttr(string compId, string name)
+                => attrByComp.ContainsKey(compId) &&
+                   attrByComp[compId].Any(a =>
+                       a.ParamName.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                       !string.IsNullOrWhiteSpace(a.ValueString));
+
+            void Add(Severity sev, string ruleId, string ruleName, string targetType, string targetKey, string msg, string fixHint, double weight)
+                => res.Findings.Add(new ComplianceFinding(sev, ruleId, ruleName, targetType, targetKey, msg, fixHint, weight));
+
+            if (components == null || components.Count == 0)
+            {
+                Add(
+                    Severity.CRITICAL, "R-000", "No assets exported",
+                    "Project", facility?.ProjectName ?? "",
+                    "No assets matched the selected profile allow-list.",
+                    "Switch profile (FULL) or verify allowed categories.",
+                    50
+                );
+            }
+
+            var dupes = components
+                .GroupBy(c => (c.AssetName ?? "").Trim(), StringComparer.OrdinalIgnoreCase)
+                .Where(g => !string.IsNullOrWhiteSpace(g.Key) && g.Count() > 1)
+                .ToList();
+
+            foreach (var d in dupes)
+            {
+                Add(
+                    Severity.CRITICAL, "R-200", "Duplicate AssetName",
+                    "Component", d.Key,
+                    $"AssetName '{d.Key}' appears {d.Count()} times.",
+                    "Ensure Marks are unique or keep auto-generation enabled.",
+                    10
+                );
+            }
+
+            foreach (var c in components)
+            {
+                var id = c.ElementId.ToString();
+
+                if (string.IsNullOrWhiteSpace(c.AssetName))
+                {
+                    Add(
+                        Severity.CRITICAL, "R-010", "AssetName missing",
+                        "Component", id,
+                        "Asset has no AssetName / identifier.",
+                        "Populate Mark or enable auto-generation.",
+                        10
+                    );
+                }
+
+                if (!string.IsNullOrWhiteSpace(c.AssetName) && !IsCompliantAssetId(c.AssetName))
+                {
+                    Add(
+                        Severity.WARNING, "R-015", "AssetName non-compliant",
+                        "Component", id,
+                        $"AssetName '{c.AssetName}' does not match PRJ-CAT-LVL-0001 pattern.",
+                        "Enable AUTO_FIX_NON_COMPLIANT_MARK or correct Mark.",
+                        2
+                    );
+                }
+
+                if (string.IsNullOrWhiteSpace(c.LevelName))
+                {
+                    Add(
+                        Severity.WARNING, "R-020", "Level missing",
+                        "Component", id,
+                        "LevelName is missing (asset may be unhosted / floating).",
+                        "Host the element or set the correct level.",
+                        3
+                    );
+                }
+
+                if (string.IsNullOrWhiteSpace(c.SpaceName))
+                {
+                    Add(
+                        Severity.WARNING, "R-030", "Space missing",
+                        "Component", id,
+                        "SpaceName is missing (common for some MEP unless rooms/spaces are configured).",
+                        "Ensure Rooms/Spaces exist and elements are inside them.",
+                        2
+                    );
+                }
+
+                if (!HasAttr(id, "Manufacturer"))
+                {
+                    var sev = (profile == ExportProfile.MepAssets || profile == ExportProfile.FullAssetRegister)
+                        ? Severity.CRITICAL
+                        : Severity.WARNING;
+
+                    Add(
+                        sev, "R-100", "Manufacturer missing",
+                        "Component", id,
+                        "Manufacturer is missing.",
+                        "Add Manufacturer parameter (type preferred) or map it in CobieMapping.json.",
+                        sev == Severity.CRITICAL ? 8 : 3
+                    );
+                }
+
+                if (!HasAttr(id, "ModelNumber"))
+                {
+                    Add(
+                        Severity.INFO, "R-110", "ModelNumber missing",
+                        "Component", id,
+                        "ModelNumber is not provided.",
+                        "Add Model/Model Number at type level (best).",
+                        1
+                    );
+                }
+            }
+
+            res.CriticalCount = res.Findings.Count(f => f.Severity == Severity.CRITICAL);
+            res.WarningCount = res.Findings.Count(f => f.Severity == Severity.WARNING);
+            res.InfoCount = res.Findings.Count(f => f.Severity == Severity.INFO);
+
+            int score = 100;
+            score -= res.CriticalCount * 15;
+            score -= res.WarningCount * 5;
+            score -= res.InfoCount * 1;
+            score = Math.Max(0, Math.Min(100, score));
+            res.ScorePercent = score;
+
+            bool pass = res.CriticalCount == 0;
+            if (options != null && options.EnableComplianceGate && options.MinScoreToPass > 0)
+                pass = pass && (res.ScorePercent >= options.MinScoreToPass);
+
+            res.Passed = pass;
+            res.Summary = res.Passed
+                ? $"PASSED • Score {res.ScorePercent}% • Critical {res.CriticalCount}, Warning {res.WarningCount}, Info {res.InfoCount}"
+                : $"FAILED • Score {res.ScorePercent}% • Critical {res.CriticalCount}, Warning {res.WarningCount}, Info {res.InfoCount}";
+
+            return res;
+        }
+
+        // ============================
+        // DEBUG: ALL PARAMS DUMP
+        // ============================
+        private static List<AttributeRow> BuildAllParamsDump(Document doc, List<Element> components, List<TypeRow> types)
+        {
+            var rows = new List<AttributeRow>();
+
+            foreach (var e in components)
+            {
+                foreach (Parameter p in e.Parameters)
+                {
+                    if (p?.Definition == null) continue;
+                    rows.Add(new AttributeRow(
+                        target: "Component",
+                        targetKey: e.Id.Value.ToString(),
+                        paramName: p.Definition.Name ?? "",
+                        storageType: p.StorageType.ToString(),
+                        valueString: ParamToString(p)
+                    ));
+                }
+
+                var tid = e.GetTypeId();
+                if (tid != ElementId.InvalidElementId && doc.GetElement(tid) is ElementType t)
+                {
+                    foreach (Parameter tp in t.Parameters)
+                    {
+                        if (tp?.Definition == null) continue;
+                        rows.Add(new AttributeRow(
+                            target: "ComponentTypeParam",
+                            targetKey: e.Id.Value.ToString(),
+                            paramName: tp.Definition.Name ?? "",
+                            storageType: tp.StorageType.ToString(),
+                            valueString: ParamToString(tp)
+                        ));
+                    }
+                }
+            }
+
+            foreach (var tr in types)
+            {
+                if (!(doc.GetElement(new ElementId(tr.TypeId)) is ElementType t)) continue;
+                foreach (Parameter p in t.Parameters)
+                {
+                    if (p?.Definition == null) continue;
+                    rows.Add(new AttributeRow(
+                        target: "Type",
+                        targetKey: tr.TypeKey,
+                        paramName: p.Definition.Name ?? "",
+                        storageType: p.StorageType.ToString(),
+                        valueString: ParamToString(p)
+                    ));
+                }
+            }
+
+            return rows;
+        }
+
+        // ============================
+        // QC REPORT
+        // ============================
+        private static List<QcRow> BuildQcReport(
+            Document doc,
+            FacilityRow facility,
+            List<FloorRow> floors,
+            List<SpaceRow> spaces,
+            List<TypeRow> types,
+            List<ComponentRow> components,
+            List<SystemRow> systems,
+            List<AttributeRow> attributes,
+            ExportProfile profile)
+        {
+            var rows = new List<QcRow>
+            {
+                new QcRow("Profile", profile.ToString()),
+                new QcRow("Project", facility.ProjectName ?? ""),
+                new QcRow("ExportedOn", DateTime.Now.ToString("yyyy-MM-dd HH:mm")),
+                new QcRow("Floors", floors.Count.ToString()),
+                new QcRow("Spaces", spaces.Count.ToString()),
+                new QcRow("Types", types.Count.ToString()),
+                new QcRow("Components (Assets)", components.Count.ToString()),
+                new QcRow("Systems (Rows)", systems.Count.ToString()),
+                new QcRow("Attributes (Curated)", attributes.Count.ToString()),
+            };
+
+            int missingLevel = components.Count(c => string.IsNullOrWhiteSpace(c.LevelName));
+            int missingSpace = components.Count(c => string.IsNullOrWhiteSpace(c.SpaceName));
+            int missingMark = components.Count(c => string.IsNullOrWhiteSpace(c.Mark));
+
+            rows.Add(new QcRow("Missing LevelName", $"{missingLevel} / {components.Count}"));
+            rows.Add(new QcRow("Missing SpaceName", $"{missingSpace} / {components.Count}"));
+            rows.Add(new QcRow("Missing Mark", $"{missingMark} / {components.Count}"));
+
+            int nonCompliantAssetIds = components.Count(c => !string.IsNullOrWhiteSpace(c.AssetName) && !IsCompliantAssetId(c.AssetName));
+            rows.Add(new QcRow("Non-compliant Asset IDs", $"{nonCompliantAssetIds} / {components.Count}"));
+
+            return rows;
+        }
+
+        // ============================
+        // WORKBOOK WRITING (ClosedXML)
+        // ============================
+        private static void WriteSheet(XLWorkbook wb, string sheetName, string[] headers, IEnumerable<object[]> rows)
+        {
+            var ws = wb.Worksheets.Add(sheetName);
+
+            for (int c = 0; c < headers.Length; c++)
+                ws.Cell(1, c + 1).SetValue(headers[c] ?? "");
+
+            int r = 2;
+            if (rows != null)
+            {
+                foreach (var row in rows)
+                {
+                    for (int c = 0; c < headers.Length; c++)
+                    {
+                        object v = (row != null && c < row.Length) ? row[c] : null;
+                        SetCellValue(ws.Cell(r, c + 1), v);
+                    }
+                    r++;
+                }
+            }
+
+            StyleHeaderRow(ws, 1);
+            ws.Columns().AdjustToContents();
+        }
+
+        private static void StyleHeaderRow(IXLWorksheet ws, int headerRow = 1)
+        {
+            try
+            {
+                var lastCol = ws.LastColumnUsed()?.ColumnNumber() ?? 0;
+                if (lastCol <= 0) return;
+
+                var row = ws.Row(headerRow);
+                row.Style.Font.Bold = true;
+
+                ws.SheetView.FreezeRows(headerRow);
+                ws.Range(headerRow, 1, headerRow, lastCol).SetAutoFilter();
+            }
+            catch { }
+        }
+
+        private static void SetCellValue(IXLCell cell, object v)
+        {
+            if (v == null) { cell.SetValue(""); return; }
+
+            if (v is int i) { cell.SetValue(i); return; }
+            if (v is long l) { cell.SetValue(l); return; }
+            if (v is double d) { cell.SetValue(d); return; }
+            if (v is float f) { cell.SetValue((double)f); return; }
+            if (v is decimal m) { cell.SetValue((double)m); return; }
+            if (v is bool b) { cell.SetValue(b); return; }
+            if (v is DateTime dt) { cell.SetValue(dt); return; }
+
+            cell.SetValue(v.ToString() ?? "");
+        }
+
+        private static void WriteMetaSheet(XLWorkbook wb, Document doc, ExportOptions opt, string logPath)
+        {
+            var ws = wb.Worksheets.Add("Meta");
+
+            var rows = new List<(string, string)>
+            {
+                ("Product", PRODUCT_NAME),
+                ("Version", PRODUCT_VERSION),
+                ("Vendor", PRODUCT_VENDOR),
+                ("ExportedOn", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")),
+                ("User", Environment.UserName),
+                ("Machine", Environment.MachineName),
+                ("ModelTitle", doc?.Title ?? ""),
+                ("Profile", opt?.Profile.ToString() ?? ""),
+                ("StrictCobie24", opt?.StrictCobie24.ToString() ?? ""),
+                ("UseMappingFile", opt?.UseMappingFile.ToString() ?? ""),
+                ("MappingFilePath", opt?.MappingFilePath ?? ""),
+                ("ComplianceGate", opt?.EnableComplianceGate.ToString() ?? ""),
+                ("MinScoreToPass", opt?.MinScoreToPass.ToString() ?? ""),
+                ("CreatedBy", opt?.CreatedBy ?? ""),
+                ("StageType", opt?.StageType ?? ""),
+                ("SafeMode", opt?.SafeMode.ToString() ?? ""),
+                ("ProjectCode", opt?.ProjectCode ?? ""),
+                ("AssetIdWriteBackParam", opt?.AssetIdWriteBackParam ?? ""),
+                ("LogPath", logPath ?? "")
+            };
+
+            ws.Cell(1, 1).Value = "Key";
+            ws.Cell(1, 2).Value = "Value";
+
+            int r = 2;
+            foreach (var kv in rows)
+            {
+                ws.Cell(r, 1).Value = kv.Item1;
+                ws.Cell(r, 2).Value = kv.Item2;
+                r++;
+            }
+
+            StyleHeaderRow(ws, 1);
+            ws.Columns().AdjustToContents();
+        }
+
+        private static void WriteWorkbook(
+            string path,
+            Document doc,
+            ExportOptions opt,
+            string logPath,
+            FacilityRow facility,
+            List<FloorRow> floors,
+            List<SpaceRow> spaces,
+            List<TypeRow> types,
+            List<ComponentRow> components,
+            List<SystemRow> systems,
+            List<AttributeRow> attributesCobie,
+            List<AttributeRow> attributesAllParams,
+            List<QcRow> qc,
+            ComplianceResult compliance,
+            ExportProfile profile)
+        {
+            var wb = new XLWorkbook();
+
+            WriteMetaSheet(wb, doc, opt, logPath);
+
+            WriteSheet(wb, "Facility",
+                new[] { "Name", "CreatedBy", "CreatedOn", "ProjectName" },
+                new[] { new object[] { facility.Name ?? "", facility.CreatedBy ?? "", facility.CreatedOn ?? "", facility.ProjectName ?? "" } });
+
+            WriteSheet(wb, "Floor",
+                new[] { "Name", "Elevation" },
+                floors.Select(f => new object[] { f.Name ?? "", f.Elevation ?? "" }));
+
+            WriteSheet(wb, "Space",
+                new[] { "Name", "RoomNumber", "FloorName", "Area" },
+                spaces.Select(s => new object[] { s.SpaceName ?? "", s.RoomNumber ?? "", s.LevelName ?? "", s.Area ?? "" }));
+
+            WriteSheet(wb, "Type",
+                new[] { "TypeKey", "FamilyName", "TypeName", "Category", "TypeId" },
+                types.Select(t => new object[] { t.TypeKey ?? "", t.FamilyName ?? "", t.TypeName ?? "", t.Category ?? "", t.TypeId }));
+
+            WriteSheet(wb, "Component",
+                new[] { "ElementId", "UniqueId", "AssetName", "Category", "FamilyName", "TypeName", "TypeKey", "LevelName", "SpaceName", "Mark", "AssetNameWasGenerated" },
+                components.Select(c => new object[] { c.ElementId, c.UniqueId ?? "", c.AssetName ?? "", c.Category ?? "", c.FamilyName ?? "", c.TypeName ?? "", c.TypeKey ?? "", c.LevelName ?? "", c.SpaceName ?? "", c.Mark ?? "", c.AssetNameWasGenerated ? "Yes" : "No" }));
+
+            WriteSheet(wb, "System",
+                new[] { "SystemName", "SystemType", "ComponentElementId" },
+                systems.Select(s => new object[] { s.SystemName ?? "", s.SystemType ?? "", s.ComponentElementId ?? "" }));
+
+            // raw attribute table stays (it’s for machines)
+            WriteSheet(wb, "Attribute_COBie",
+                new[] { "Target", "TargetKey", "ParamName", "StorageType", "ValueString" },
+                attributesCobie
+                    .OrderBy(a => a.TargetKey)
+                    .ThenBy(a => a.ParamName)
+                    .Select(a => new object[] { a.Target ?? "", a.TargetKey ?? "", a.ParamName ?? "", a.StorageType ?? "", a.ValueString ?? "" }));
+
+            WriteSheet(wb, "QC_Report",
+                new[] { "Metric", "Value" },
+                qc.Select(q => new object[] { q.Metric ?? "", q.Value ?? "" }));
+
+            WriteComplianceSheet(wb, compliance);
+
+            if (EXPORT_ALL_PARAMS_DEBUG_SHEET)
+            {
+                WriteSheet(wb, "Attribute_AllParams",
+                    new[] { "Target", "TargetKey", "ParamName", "StorageType", "ValueString" },
+                    attributesAllParams.Select(a => new object[] { a.Target ?? "", a.TargetKey ?? "", a.ParamName ?? "", a.StorageType ?? "", a.ValueString ?? "" }));
+            }
+
+            wb.SaveAs(path);
+        }
+
+        // ============================
+        // 🔥 SERIOUS GROUPING FIX (STRICT COBie Attribute sheet)
+        // ============================
+        private static IEnumerable<object[]> BuildStrictAttributeRows(
+            List<ComponentRow> components,
+            List<AttributeRow> attributesCobie,
+            string createdBy,
+            string createdOn,
+            string stageType)
+        {
+            var compByElementId = (components ?? new List<ComponentRow>())
+                .GroupBy(c => c.ElementId)
+                .ToDictionary(g => g.Key.ToString(), g => g.First());
+
+            string ResolveRowName(string elementId)
+            {
+                if (string.IsNullOrWhiteSpace(elementId)) return "";
+                if (compByElementId.TryGetValue(elementId.Trim(), out var c))
+                    return (c.AssetName ?? "").Trim(); // ✅ real grouping key
+                return elementId.Trim();
+            }
+
+            string ResolveExternalId(string elementId)
+            {
+                if (string.IsNullOrWhiteSpace(elementId)) return "";
+                if (compByElementId.TryGetValue(elementId.Trim(), out var c))
+                    return (c.UniqueId ?? "").Trim(); // ✅ best practice identifier
+                return elementId.Trim();
+            }
+
+            // HARD CLEAN:
+            // - only Component attrs
+            // - remove blanks
+            // - dedupe by (RowName, Name, Value)
+            // - sort by RowName then Name
+            var rows = (attributesCobie ?? new List<AttributeRow>())
+                .Where(a => a != null)
+                .Where(a => string.Equals(a.Target, "Component", StringComparison.OrdinalIgnoreCase))
+                .Select(a =>
+                {
+                    var elementId = (a.TargetKey ?? "").Trim();
+                    var rowName = ResolveRowName(elementId);
+                    var name = (a.ParamName ?? "").Trim();
+                    var value = (a.ValueString ?? "").Trim();
+
+                    return new
+                    {
+                        Name = name,
+                        RowName = rowName,
+                        Value = value,
+                        ExternalIdentifier = ResolveExternalId(elementId)
+                    };
+                })
+                .Where(x => !string.IsNullOrWhiteSpace(x.RowName))
+                .Where(x => !string.IsNullOrWhiteSpace(x.Name))
+                .Where(x => !string.IsNullOrWhiteSpace(x.Value))
+                .GroupBy(x => (x.RowName, x.Name, x.Value), StrictAttrKeyComparer.Instance)
+                .Select(g => g.First())
+                .OrderBy(x => x.RowName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var x in rows)
+            {
+                yield return new object[]
+                {
+                    x.Name,
+                    createdBy,
+                    createdOn,
+                    stageType,
+                    "Component",         // SheetName (COBie)
+                    x.RowName,           // RowName (GROUPED)
+                    x.Value,
+                    "",
+                    x.ExternalIdentifier // ExternalIdentifier (UniqueId)
+                };
+            }
+        }
+
+        private sealed class StrictAttrKeyComparer : IEqualityComparer<(string RowName, string Name, string Value)>
+        {
+            public static readonly StrictAttrKeyComparer Instance = new StrictAttrKeyComparer();
+            public bool Equals((string RowName, string Name, string Value) x, (string RowName, string Name, string Value) y)
+            {
+                return string.Equals(x.RowName, y.RowName, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(x.Value, y.Value, StringComparison.OrdinalIgnoreCase);
+            }
+            public int GetHashCode((string RowName, string Name, string Value) obj)
+            {
+                unchecked
+                {
+                    int h = 17;
+                    h = (h * 31) + (obj.RowName ?? "").ToLowerInvariant().GetHashCode();
+                    h = (h * 31) + (obj.Name ?? "").ToLowerInvariant().GetHashCode();
+                    h = (h * 31) + (obj.Value ?? "").ToLowerInvariant().GetHashCode();
+                    return h;
+                }
+            }
+        }
+
+        private static void WriteWorkbookStrictCobie24(
+            string path,
+            Document doc,
+            ExportOptions opt,
+            string logPath,
+            FacilityRow facility,
+            List<FloorRow> floors,
+            List<SpaceRow> spaces,
+            List<TypeRow> types,
+            List<ComponentRow> components,
+            List<SystemRow> systems,
+            List<AttributeRow> attributesCobie,
+            ComplianceResult compliance)
+        {
+            string createdBy = string.IsNullOrWhiteSpace(opt?.CreatedBy) ? Environment.UserName : opt.CreatedBy;
+            string stageType = string.IsNullOrWhiteSpace(opt?.StageType) ? "AsBuilt" : opt.StageType;
+
+            var wb = new XLWorkbook();
+            string now = DateTime.Now.ToString("yyyy-MM-dd");
+
+            WriteMetaSheet(wb, doc, opt, logPath);
+
+            WriteSheet(wb, "Facility",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "ProjectName" },
+                new[] { new object[] { facility.Name ?? "", createdBy, now, stageType, facility.ProjectName ?? "" } });
+
+            WriteSheet(wb, "Floor",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "Elevation" },
+                floors.Select(f => new object[] { f.Name ?? "", createdBy, now, stageType, f.Elevation ?? "" }));
+
+            WriteSheet(wb, "Space",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "FloorName", "RoomNumber", "Area" },
+                spaces.Select(s => new object[] { s.SpaceName ?? "", createdBy, now, stageType, s.LevelName ?? "", s.RoomNumber ?? "", s.Area ?? "" }));
+
+            WriteSheet(wb, "Type",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "Description", "AssetType", "ExternalIdentifier" },
+                types.Select(t => new object[]
+                {
+                    $"{t.FamilyName ?? ""}:{t.TypeName ?? ""}",
+                    createdBy,
+                    now,
+                    stageType,
+                    t.Category ?? "",
+                    t.Category ?? "",
+                    t.TypeKey ?? ""
+                }));
+
+            WriteSheet(wb, "Component",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "TypeName", "Space", "TagNumber", "ExternalIdentifier" },
+                components
+                    .OrderBy(c => c.AssetName, StringComparer.OrdinalIgnoreCase)
+                    .Select(c => new object[]
+                    {
+                        c.AssetName ?? "",
+                        createdBy,
+                        now,
+                        stageType,
+                        $"{c.FamilyName ?? ""}:{c.TypeName ?? ""}",
+                        c.SpaceName ?? "",
+                        c.Mark ?? "",
+                        c.UniqueId ?? ""
+                    }));
+
+            WriteSheet(wb, "System",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "ComponentElementIds" },
+                systems
+                    .Where(s => !string.IsNullOrWhiteSpace(s.SystemName))
+                    .GroupBy(s => s.SystemName)
+                    .Select(g => new object[]
+                    {
+                        g.Key,
+                        createdBy,
+                        now,
+                        stageType,
+                        string.Join(";", g.Select(x => x.ComponentElementId).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct())
+                    }));
+
+            // ✅ FIXED: Strict Attribute is now grouped + deduped + sorted + UniqueId external identifier
+            WriteSheet(wb, "Attribute",
+                new[] { "Name", "CreatedBy", "CreatedOn", "Category", "SheetName", "RowName", "Value", "Unit", "ExternalIdentifier" },
+                BuildStrictAttributeRows(components, attributesCobie, createdBy, now, stageType));
+
+            WriteComplianceSheet(wb, compliance);
+
+            wb.SaveAs(path);
+        }
+
+        private static void WriteComplianceSheet(XLWorkbook wb, ComplianceResult compliance)
+        {
+            var ws = wb.Worksheets.Add("Compliance");
+
+            ws.Cell(1, 1).Value = "ComplianceScore";
+            ws.Cell(1, 2).Value = (compliance?.ScorePercent ?? 0) + "%";
+            ws.Cell(2, 1).Value = "Gate";
+            ws.Cell(2, 2).Value = (compliance != null && compliance.Passed) ? "PASS" : "FAIL";
+            ws.Cell(3, 1).Value = "CRITICAL";
+            ws.Cell(3, 2).Value = compliance?.CriticalCount ?? 0;
+            ws.Cell(4, 1).Value = "WARNING";
+            ws.Cell(4, 2).Value = compliance?.WarningCount ?? 0;
+            ws.Cell(5, 1).Value = "INFO";
+            ws.Cell(5, 2).Value = compliance?.InfoCount ?? 0;
+            ws.Cell(6, 1).Value = "Summary";
+            ws.Cell(6, 2).Value = compliance?.Summary ?? "";
+
+            int startRow = 8;
+            string[] headers = { "Severity", "RuleId", "RuleName", "TargetType", "TargetKey", "Message", "FixHint" };
+            for (int i = 0; i < headers.Length; i++)
+                ws.Cell(startRow, i + 1).Value = headers[i];
+
+            int r = startRow + 1;
+            foreach (var f in (compliance?.Findings ?? new List<ComplianceFinding>())
+                         .OrderByDescending(x => x.Severity)
+                         .ThenBy(x => x.RuleId))
+            {
+                ws.Cell(r, 1).Value = f.Severity.ToString();
+                ws.Cell(r, 2).Value = f.RuleId ?? "";
+                ws.Cell(r, 3).Value = f.RuleName ?? "";
+                ws.Cell(r, 4).Value = f.TargetType ?? "";
+                ws.Cell(r, 5).Value = f.TargetKey ?? "";
+                ws.Cell(r, 6).Value = f.Message ?? "";
+                ws.Cell(r, 7).Value = f.FixHint ?? "";
+
+                var range = ws.Range(r, 1, r, 7);
+                if (f.Severity == Severity.CRITICAL)
+                {
+                    range.Style.Font.Bold = true;
+                    range.Style.Fill.BackgroundColor = XLColor.FromHtml("#F8D7DA");
+                }
+                else if (f.Severity == Severity.WARNING)
+                {
+                    range.Style.Fill.BackgroundColor = XLColor.FromHtml("#FFF3CD");
+                }
+                else
+                {
+                    range.Style.Fill.BackgroundColor = XLColor.FromHtml("#E2E3E5");
+                }
+
+                r++;
+            }
+
+            StyleHeaderRow(ws, startRow);
+            ws.Columns().AdjustToContents();
+        }
+
+        // ============================
+        // HELPERS
+        // ============================
+        private static string TryGetLevelName(Document doc, Element e)
+        {
+            try
+            {
+                var levelId = e.LevelId;
+                if (levelId != ElementId.InvalidElementId)
+                    return (doc.GetElement(levelId) as Level)?.Name ?? "";
+            }
+            catch { }
+            return "";
+        }
+
+        private static string GetBuiltInParamAsString(Element e, BuiltInParameter bip)
+        {
+            try
+            {
+                var p = e.get_Parameter(bip);
+                return p == null ? "" : ParamToString(p);
+            }
+            catch { return ""; }
+        }
+
+        private static string TryGetBuiltInParamValue(Element e, BuiltInParameter bip)
+        {
+            try
+            {
+                var p = e.get_Parameter(bip);
+                if (p == null) return "";
+                return ParamToString(p);
+            }
+            catch { return ""; }
+        }
+
+        private static string TryGetParamByNames(Element e, List<string> names)
+        {
+            if (e == null || names == null || names.Count == 0) return "";
+            foreach (var n in names)
+            {
+                if (string.IsNullOrWhiteSpace(n)) continue;
+                try
+                {
+                    var p = e.LookupParameter(n);
+                    if (p == null) continue;
+                    var v = ParamToString(p);
+                    if (!string.IsNullOrWhiteSpace(v)) return v;
+                }
+                catch { }
+            }
+            return "";
+        }
+
+        private static string ParamToString(Parameter p)
+        {
+            if (p == null) return "";
+            try
+            {
+                var vs = p.AsValueString();
+                if (!string.IsNullOrWhiteSpace(vs)) return vs;
+
+                switch (p.StorageType)
+                {
+                    case StorageType.String: return p.AsString() ?? "";
+                    case StorageType.Integer: return p.AsInteger().ToString();
+                    case StorageType.Double: return p.AsDouble().ToString("0.###");
+                    case StorageType.ElementId:
+                        var id = p.AsElementId();
+                        return id == null ? "" : ((int)id.Value).ToString();
+                    default: return "";
+                }
+            }
+            catch { return ""; }
+        }
+
+        private static string Sanitize(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "Model";
+            foreach (var ch in Path.GetInvalidFileNameChars())
+                name = name.Replace(ch, '_');
+            return name;
+        }
+
+        private static string SanitizeId(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "NA";
+            var cleaned = new string(s.Where(ch => char.IsLetterOrDigit(ch) || ch == '-' || ch == '_').ToArray());
+            if (string.IsNullOrWhiteSpace(cleaned)) cleaned = "NA";
+            return ENFORCE_UPPERCASE_IDS ? cleaned.ToUpperInvariant() : cleaned;
+        }
+
+        private static string Abbrev(string categoryName)
+        {
+            if (string.IsNullOrWhiteSpace(categoryName)) return "ASSET";
+            string c = categoryName.ToLowerInvariant();
+            if (c.Contains("door")) return "DOOR";
+            if (c.Contains("window")) return "WIN";
+            if (c.Contains("mechanical")) return "MECH";
+            if (c.Contains("electrical")) return "ELEC";
+            if (c.Contains("plumbing")) return "PLMB";
+            if (c.Contains("lighting")) return "LGT";
+            if (c.Contains("fire")) return "FIRE";
+            if (c.Contains("security")) return "SEC";
+            return new string(categoryName.Where(char.IsLetterOrDigit).Take(6).ToArray()).ToUpperInvariant();
+        }
+    }
+}
+
+
+
+
+
+
+
+
