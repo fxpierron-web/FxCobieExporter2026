@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<RevitAddIns>
+  <AddIn Type="Command">
+    <Name>FX COBie Exporter 2026</Name>
+    <Assembly>C:\ProgramData\Autodesk\Revit\Addins\2026\FxCobieExporter\CobieExcel2026.dll</Assembly>
+    <AddInId>8D83C886-B739-4ACD-A9DB-1BC78F315B2B</AddInId>
+    <FullClassName>CobieExporter2026.ExportCobieCommand</FullClassName>
+    <VendorId>FXPI</VendorId>
+    <VendorDescription>FX Pierron - Enterprise COBie Export</VendorDescription>
+  </AddIn>
+</RevitAddIns>
